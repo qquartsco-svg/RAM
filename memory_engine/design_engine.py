@@ -844,6 +844,305 @@ def sweep_sram_mode_beta(
     return results
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# B. 시나리오 시뮬레이션
+# ══════════════════════════════════════════════════════════════════════════════
+
+def scenario_high_temp_dram_collapse(
+    params: DRAMDesignParams,
+    T_range: List[float],
+    n_points: int = 10,
+) -> Dict[str, Any]:
+    """B1 시나리오: 고온에서 DRAM retention 붕괴 분석.
+
+    Arrhenius 가속으로 온도 상승 시 τ 급감 → retention time 한계 단축.
+    각 온도에서 τ, time_to_fail, Ω 궤적(초기/τ/2τ 시점)을 계산.
+
+    Args:
+        params  : DRAM 설계 파라미터 (T_k 덮어씀).
+        T_range : 분석할 온도 목록 [K].
+        n_points: 각 온도에서 τ 기준 시뮬레이션 포인트 수.
+
+    Returns:
+        {
+          "per_temperature": [ {T_k, tau_s, time_to_fail_s, t_fail_ratio,
+                                 q_at_tau, omega_at_tau, omega_at_2tau,
+                                 verdict} ],
+          "reference_T_k": params.T_ref_k,
+          "reference_tau_s": τ at T_ref,
+          "collapse_T_k": 온도 중 time_to_fail이 refresh 주기(64ms) 이하가 되는 첫 T,
+          "summary": str,
+        }
+    """
+    from .dram_physics import retention_tau as _tau, time_to_fail as _ttf
+    from .observer import observe_dram as _obs_dram
+
+    REFRESH_PERIOD_S = 64e-3  # 표준 DRAM 최대 refresh 간격
+    ref_tau = _tau(_dram_replace(params, T_k=params.T_ref_k))
+
+    per_T: List[Dict[str, Any]] = []
+    collapse_T = None
+
+    for T in T_range:
+        p = _dram_replace(params, T_k=float(T))
+        tau = _tau(p)
+        ttf = _ttf(p)
+
+        # q_at_tau: τ 경과 후 전하 = exp(-1) ≈ 0.368
+        q_tau = math.exp(-1.0)  # q0=1 기준
+        cell_tau = DRAMCellState(q=max(0.0, q_tau))
+        obs_tau = _obs_dram(cell_tau, p)
+
+        # q_at_2tau: 2τ 경과 후 = exp(-2) ≈ 0.135
+        q_2tau = math.exp(-2.0)
+        cell_2tau = DRAMCellState(q=max(0.0, q_2tau))
+        obs_2tau = _obs_dram(cell_2tau, p)
+
+        # time_to_fail / τ 비율 (이상적 셀은 크고, 고온 열화 셀은 작아짐)
+        t_fail_ratio = ttf / max(1e-9, tau) if ttf > 0 else 0.0
+
+        row = {
+            "T_k":             round(float(T), 2),
+            "tau_s":           round(tau, 6),
+            "tau_speedup_x":   round(ref_tau / max(1e-9, tau), 3),
+            "time_to_fail_s":  round(ttf, 6),
+            "t_fail_ratio":    round(t_fail_ratio, 3),
+            "q_at_tau":        round(q_tau, 6),
+            "omega_at_tau":    obs_tau.omega_global,
+            "omega_at_2tau":   obs_2tau.omega_global,
+            "verdict_at_tau":  obs_tau.verdict,
+            "refresh_ok":      ttf > REFRESH_PERIOD_S,
+        }
+        per_T.append(row)
+
+        if collapse_T is None and ttf <= REFRESH_PERIOD_S:
+            collapse_T = float(T)
+
+    # 요약 문자열
+    ref_row = per_T[0] if per_T else {}
+    if collapse_T is not None:
+        summary = (
+            f"붕괴 임계 온도: {collapse_T}K — "
+            f"T_ref({params.T_ref_k}K) 대비 τ "
+            f"{ref_row.get('tau_speedup_x', '?')}× 가속. "
+            f"retention이 표준 refresh 주기(64ms) 이하로 단축."
+        )
+    else:
+        summary = (
+            f"분석 범위 내({T_range[0]}K~{T_range[-1]}K) retention 붕괴 없음 — "
+            f"τ 최소 {min(r['tau_s'] for r in per_T)*1000:.2f}ms "
+            f"(refresh 64ms 초과 유지)."
+        )
+
+    return {
+        "per_temperature":  per_T,
+        "reference_T_k":    params.T_ref_k,
+        "reference_tau_s":  round(ref_tau, 6),
+        "collapse_T_k":     collapse_T,
+        "summary":          summary,
+    }
+
+
+def scenario_sram_beta_sweep_report(
+    params: SRAMDesignParams,
+    beta_range: List[float],
+) -> Dict[str, Any]:
+    """B2 시나리오: SRAM beta 스윕 3모드 종합 리포트.
+
+    Hold SNM / Read SNM(물리) / Write Margin을 beta_ratio 함수로 분석.
+    beta_opt: WM과 Read SNM이 모두 임계 이상인 최대 beta 탐색.
+
+    Args:
+        params    : SRAM 설계 파라미터 (beta_ratio 덮어씀).
+        beta_range: beta_ratio 목록 (오름차순 권장).
+
+    Returns:
+        {
+          "per_beta": [ {beta_ratio, hold_snm_v, read_snm_v, write_margin_v,
+                          node_disturb_risk, verdict, omega_global} ],
+          "beta_opt": 최적 beta (WM≥60mV AND rsnm≥30mV 만족하는 최대값),
+          "tradeoff_summary": str,
+          "pass_count": int,
+          "fail_count": int,
+        }
+    """
+    per_beta: List[Dict[str, Any]] = []
+    pass_count = 0
+    fail_count = 0
+    beta_opt = None
+
+    for beta in sorted(beta_range):
+        p = _sram_replace(params, beta_ratio=float(beta))
+        cell = SRAMCellState(v_q=p.vdd_v, v_qb=0.0)
+        obs = observe_sram(cell, p)
+        analysis = sram_mode_analysis(p)
+
+        row = {
+            "beta_ratio":       round(beta, 3),
+            "hold_snm_v":       analysis["hold_snm_v"],
+            "read_snm_v":       analysis["read_snm_physical_v"],
+            "write_margin_v":   analysis["write_margin_v"],
+            "read_node_dv":     analysis["read_node_disturb_v"],
+            "node_disturb_risk": analysis["node_disturb_risk"],
+            "stability_index":  analysis["stability_index"],
+            "verdict":          analysis["verdict"],
+            "omega_global":     obs.omega_global,
+        }
+        per_beta.append(row)
+
+        if analysis["verdict"] == "PASS":
+            pass_count += 1
+        elif analysis["verdict"] == "FAIL":
+            fail_count += 1
+
+        # 최적 beta: WM≥50mV AND read_snm≥20mV 조건 만족하는 최대 beta
+        if (analysis["write_margin_v"] >= 0.050
+                and analysis["read_snm_physical_v"] >= 0.020):
+            beta_opt = round(beta, 3)
+
+    # 트레이드오프 요약
+    if per_beta:
+        snm_vals = [r["hold_snm_v"] for r in per_beta]
+        wm_vals  = [r["write_margin_v"] for r in per_beta]
+        tradeoff_summary = (
+            f"SNM: {min(snm_vals)*1000:.1f}→{max(snm_vals)*1000:.1f}mV "
+            f"(β {per_beta[0]['beta_ratio']}→{per_beta[-1]['beta_ratio']}). "
+            f"WM: {max(wm_vals)*1000:.1f}→{min(wm_vals)*1000:.1f}mV (역비례). "
+            + (f"최적 beta={beta_opt}" if beta_opt else "최적 beta 없음 — 파라미터 재검토 필요.")
+        )
+    else:
+        tradeoff_summary = "분석 데이터 없음."
+
+    return {
+        "per_beta":         per_beta,
+        "beta_opt":         beta_opt,
+        "tradeoff_summary": tradeoff_summary,
+        "pass_count":       pass_count,
+        "fail_count":       fail_count,
+        "node_nm":          params.node_nm,
+    }
+
+
+def scenario_vdd_drop_cascade(
+    dram_params: DRAMDesignParams,
+    sram_params: SRAMDesignParams,
+    sa_params: "SAParams",  # type: ignore[name-defined]
+    vdd_range: List[float],
+) -> Dict[str, Any]:
+    """B3 시나리오: 전원 전압 강하에 의한 DRAM+SRAM 연쇄 실패 분석.
+
+    Vdd 감소 시 DRAM bitline swing 감소 → SA 마진 소실 → read_margin 실패.
+    동시에 SRAM SNM/RNM/WM도 감소 → 셀 불안정.
+
+    Args:
+        dram_params: DRAM 설계 파라미터 (vdd_v 덮어씀).
+        sram_params: SRAM 설계 파라미터 (vdd_v 덮어씀).
+        sa_params  : 센스앰프 파라미터.
+        vdd_range  : Vdd 목록 [V] (내림차순 권장).
+
+    Returns:
+        {
+          "per_vdd": [ {vdd_v, dram_bitline_swing, dram_read_margin,
+                         dram_sa_margin, dram_read_ok,
+                         sram_snm_v, sram_rnm_v, sram_wm_v,
+                         sram_verdict, combined_verdict} ],
+          "dram_fail_vdd": DRAM read 실패 시작 Vdd (None이면 범위 내 안전),
+          "sram_fail_vdd": SRAM verdict FAIL 시작 Vdd,
+          "cascade_start_vdd": 두 실패 중 먼저 발생한 Vdd,
+          "summary": str,
+        }
+    """
+    from .dram_physics import (
+        bitline_swing_fraction as _bsf,
+        read_margin as _rm,
+    )
+    from .sense_amplifier import sense_op as _sa_sense
+    from .sram_physics import (
+        static_noise_margin as _snm,
+        read_noise_margin as _rnm,
+        write_margin as _wm,
+    )
+
+    per_vdd: List[Dict[str, Any]] = []
+    dram_fail_vdd = None
+    sram_fail_vdd = None
+
+    for vdd in sorted(vdd_range, reverse=True):
+        vdd = round(float(vdd), 4)
+
+        # DRAM: Vdd 변경 (전하 q=1 기준, 비례 조정은 실제론 Cs/Cbl 유지)
+        dp = _dram_replace(dram_params, vdd_v=vdd)
+        cell_d = DRAMCellState(q=1.0)
+        swing  = _bsf(cell_d, dp)
+        dram_rm = _rm(cell_d, dp)
+        sa_obs = _sa_sense(cell_d, dp, sa_params)
+
+        # SRAM: Vdd 변경 (Vth 유지 — 마진 압박 증가)
+        sp = _sram_replace(sram_params, vdd_v=vdd)
+        cell_s = SRAMCellState(v_q=vdd, v_qb=0.0)
+        sram_obs = observe_sram(cell_s, sp)
+        snm_v = _snm(sp)
+        rnm_v = _rnm(sp)
+        wm_v  = _wm(sp)
+
+        dram_ok = sa_obs.read_success
+        sram_ok = sram_obs.verdict in ("HEALTHY", "STABLE")
+
+        if combined_v := ("OK" if (dram_ok and sram_ok)
+                          else ("DRAM_FAIL" if (not dram_ok and sram_ok)
+                          else ("SRAM_FAIL" if (dram_ok and not sram_ok)
+                          else "BOTH_FAIL"))):
+            pass
+
+        row = {
+            "vdd_v":              vdd,
+            "dram_bitline_swing": round(swing, 6),
+            "dram_read_margin":   round(dram_rm, 6),
+            "dram_sa_margin_v":   sa_obs.sa_margin_v,
+            "dram_read_ok":       dram_ok,
+            "sram_snm_v":         round(snm_v, 6),
+            "sram_rnm_v":         round(rnm_v, 6),
+            "sram_wm_v":          round(wm_v, 6),
+            "sram_omega":         sram_obs.omega_global,
+            "sram_verdict":       sram_obs.verdict,
+            "combined_verdict":   combined_v,
+        }
+        per_vdd.append(row)
+
+        if not dram_ok and dram_fail_vdd is None:
+            dram_fail_vdd = vdd
+        if sram_obs.verdict in ("FRAGILE", "CRITICAL") and sram_fail_vdd is None:
+            sram_fail_vdd = vdd
+
+    # per_vdd는 역순 저장됐으므로 Vdd 오름차순으로 재정렬
+    per_vdd.sort(key=lambda r: r["vdd_v"])
+
+    # cascade 시작 Vdd (두 실패 중 더 높은 Vdd = 먼저 발생)
+    fails = [v for v in [dram_fail_vdd, sram_fail_vdd] if v is not None]
+    cascade_start = max(fails) if fails else None
+
+    # 요약
+    parts = []
+    if dram_fail_vdd:
+        parts.append(f"DRAM SA 마진 실패: Vdd≤{dram_fail_vdd}V")
+    else:
+        parts.append("DRAM: 범위 내 안전")
+    if sram_fail_vdd:
+        parts.append(f"SRAM 불안정 시작: Vdd≤{sram_fail_vdd}V")
+    else:
+        parts.append("SRAM: 범위 내 안정")
+    if cascade_start:
+        parts.append(f"연쇄 실패 시작점: {cascade_start}V")
+
+    return {
+        "per_vdd":           per_vdd,
+        "dram_fail_vdd":     dram_fail_vdd,
+        "sram_fail_vdd":     sram_fail_vdd,
+        "cascade_start_vdd": cascade_start,
+        "summary":           " | ".join(parts),
+    }
+
+
 def _dram_replace(params: DRAMDesignParams, **kwargs: Any) -> DRAMDesignParams:
     """DRAMDesignParams(frozen) 일부 필드 대체 사본 생성."""
     return replace(params, **kwargs)

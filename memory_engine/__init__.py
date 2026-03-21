@@ -103,6 +103,10 @@ from .design_engine import (
     # A3: SRAM 3모드
     sram_mode_analysis,
     sweep_sram_mode_beta,
+    # B: 시나리오
+    scenario_high_temp_dram_collapse,
+    scenario_sram_beta_sweep_report,
+    scenario_vdd_drop_cascade,
 )
 from .presets import (
     LPDDR5_PARAMS,
@@ -191,6 +195,10 @@ __all__ = [
     # A3 SRAM 3모드 분석
     "sram_mode_analysis",
     "sweep_sram_mode_beta",
+    # B 시나리오
+    "scenario_high_temp_dram_collapse",
+    "scenario_sram_beta_sweep_report",
+    "scenario_vdd_drop_cascade",
     # 프리셋
     "LPDDR5_PARAMS",
     "DDR5_PARAMS",
