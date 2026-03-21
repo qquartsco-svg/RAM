@@ -108,6 +108,14 @@ from .design_engine import (
     scenario_sram_beta_sweep_report,
     scenario_vdd_drop_cascade,
 )
+from .bridge_battery import (
+    BatteryECMParams,
+    BatteryStep,
+    simulate_battery_discharge,
+    vterm_to_vdd,
+    battery_memory_cascade,
+    sweep_soc_memory_health,
+)
 from .presets import (
     LPDDR5_PARAMS,
     DDR5_PARAMS,
@@ -199,6 +207,13 @@ __all__ = [
     "scenario_high_temp_dram_collapse",
     "scenario_sram_beta_sweep_report",
     "scenario_vdd_drop_cascade",
+    # D Battery-Memory 브리지
+    "BatteryECMParams",
+    "BatteryStep",
+    "simulate_battery_discharge",
+    "vterm_to_vdd",
+    "battery_memory_cascade",
+    "sweep_soc_memory_health",
     # 프리셋
     "LPDDR5_PARAMS",
     "DDR5_PARAMS",
