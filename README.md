@@ -9,6 +9,10 @@
 RC 방전·Arrhenius 가속·SNM butterfly curve·Row Hammer·센스앰프 BER 등
 실제 팹리스 설계에서 사용하는 핵심 물리 모델을 stdlib만으로 구현합니다.
 
+> **⚠️ 범위 안내** — 본 엔진은 Python 기반의 **설계 탐색·마진 추정·시나리오 분석** 도구입니다.
+> SPICE 회로 시뮬레이션·TCAD 공정 시뮬레이션·레이아웃 signoff를 대체하지 않습니다.
+> 모든 수치는 단순화된 해석 모델 기반 추정치이며, 실리콘 측정값과 차이가 있을 수 있습니다.
+
 ---
 
 ## 목차
@@ -178,11 +182,22 @@ Vm = (Vdd + Vth_n·√β − Vth_p) / (1 + √β)
 
 ### Static Noise Margin (SNM)
 
-Seevinck 해석 공식 + 수치 VTC 그리드 평균:
+두 단계 계산으로 SNM을 추정합니다:
 
+**① 해석적 추정 (Seevinck 공식)** — 스위칭 포인트 Vm 기반 닫힌 형태 근사:
 ```
-SNM_analytic = 0.5 × (Vdd − Vth_n − Vth_p) × (β−1)/(β+1)
+SNM_analytic ≈ 0.5 × (Vdd − Vth_n − Vth_p) × (β−1)/(β+1)
 ```
+빠른 트렌드 분석에 적합하지만, 실제 butterfly 최대 내접 정사각형과 차이가 있을 수 있습니다.
+
+**② 수치 VTC 그리드 평균** — 201포인트 piece-wise VTC를 두 인버터에 대해 샘플링하고
+교차 영역의 평균 마진을 계산하여 해석 공식을 보정합니다:
+```
+SNM = 0.5 × (SNM_analytic + SNM_numeric_avg)
+```
+
+> 두 방법 모두 **단순화 모델 기반 추정치**입니다. SPICE-level Monte Carlo 시뮬레이션이나
+> 실리콘 측정 butterfly curve와 정확히 일치하지 않을 수 있습니다.
 
 ```python
 from memory_engine import static_noise_margin, SRAM_7NM, SRAM_65NM
@@ -323,6 +338,16 @@ for r in sweep:
 | Ω_speed | 0.15 | 접근 시간 t_access |
 | Ω_power | 0.10 | Vdd, 누설 전류 |
 
+### SRAM Observer
+
+| 레이어 | 가중치 | 기반 지표 |
+|--------|--------|-----------|
+| Ω_snm | 0.30 | SNM / (Vdd/2) — 정규화 노이즈 마진 |
+| Ω_margin | 0.25 | RNM (읽기 노이즈 마진) / (Vdd×0.3) |
+| Ω_write | 0.20 | Write Margin / (Vdd×0.25) |
+| Ω_leakage | 0.15 | 누설 열화율 (leakage_factor) |
+| Ω_power | 0.10 | Vdd / Vdd_nom |
+
 ```
 Ω_global = Σ (weight_i × Ω_i)
 ```
@@ -378,6 +403,10 @@ for row in result["per_temperature"]:
   T=400K  τ=0.31ms   208×가속  ✗ COLLAPSE
 ```
 
+> **📌 모델 의존 수치** — τ 및 가속 배율은 프리셋의 `Ea`(활성화 에너지), `tau_ref_s`, `T_ref_k`
+> 파라미터에 강하게 의존합니다. JEDEC JESD79 규격 수치와 직접 대응하지 않으며,
+> 실제 다이 특성은 셀 구조·도핑 프로파일·측정 조건에 따라 크게 달라집니다.
+
 ### B2. SRAM beta sweep 리포트
 
 ```python
@@ -417,7 +446,11 @@ for row in result["per_vdd"]:
 
 ## Battery-Memory 브리지 (D)
 
-배터리 방전 시 단자 전압 강하 → PMIC 변환 → 메모리 Vdd 감소 → 마진 열화를 연동 분석:
+배터리 방전 시 단자 전압 강하 → PMIC 변환 → 메모리 Vdd 감소 → 마진 열화를 연동 분석.
+
+> **📌 간략 ECM 기반** — 내장 배터리 모델은 단일 RC 등가회로(ECM: Equivalent Circuit Model)
+> 기반의 간략 모델입니다. 실제 전기화학 셀의 농도 분극·SEI 성장·온도 의존성 등
+> 상세 거동은 반영되지 않으며, 상세 전기화학 셀 모델은 후속 확장 범위입니다.
 
 ```
 V_term(SOC) = V₀ + k_ocv × SOC − I × R₀ − V_RC
