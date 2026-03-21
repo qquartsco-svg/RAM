@@ -2,12 +2,13 @@
 
 계층 구조
 ─────────
-  schema.py        — 셀 상태, 설계 파라미터, 관측·검증 스키마
-  dram_physics.py  — DRAM 물리 (RC 방전, Arrhenius 보정, read disturb, refresh)
-  sram_physics.py  — SRAM 물리 (VTC, SNM, RNM, WM, stability index)
-  observer.py      — Ω 5레이어 관측 (DRAM/SRAM) + 진단
-  design_engine.py — 시뮬레이션, 파라미터 스윕, 검증 보고서
-  presets.py       — 공정 프리셋 (LPDDR5/DDR5/DDR4/DDR3, SRAM 7~65nm)
+  schema.py           — 셀 상태, 설계 파라미터, 관측·검증 스키마 (SAParams, SAObservation 포함)
+  dram_physics.py     — DRAM 물리 (RC 방전, Arrhenius, read disturb, refresh, Row Hammer)
+  sram_physics.py     — SRAM 물리 (VTC, SNM, RNM, WM, 3모드 분석)
+  sense_amplifier.py  — 센스앰프 (differential latch, BER, Q-function)
+  observer.py         — Ω 5레이어 관측 (DRAM/SRAM) + 진단
+  design_engine.py    — 시뮬레이션, 파라미터 스윕, 검증 보고서
+  presets.py          — 공정 프리셋 (LPDDR5/DDR5/DDR4/DDR3, SRAM 7~65nm, SA 7/28/65nm)
 
 빠른 시작
 ─────────
@@ -35,6 +36,8 @@ from .schema import (
     SRAMDesignParams,
     MemoryObservation,
     VerificationReport,
+    SAParams,
+    SAObservation,
 )
 from .dram_physics import (
     retention_tau,
@@ -46,6 +49,17 @@ from .dram_physics import (
     read_margin as dram_read_margin,
     refresh_needed,
     time_to_fail,
+    row_hammer_disturb,
+    row_hammer_failure_threshold,
+)
+from .sense_amplifier import (
+    sense_op,
+    sa_bit_error_rate,
+    sa_row_ber,
+    sa_min_delta_v_for_ber,
+    SA_7NM as SA_PARAMS_7NM,
+    SA_28NM as SA_PARAMS_28NM,
+    SA_65NM as SA_PARAMS_65NM,
 )
 from .sram_physics import (
     vtc_curve,
@@ -58,6 +72,9 @@ from .sram_physics import (
     sram_write,
     sram_read,
     sram_leakage_decay,
+    read_node_disturb_v,
+    read_snm_physical,
+    snm_by_mode,
 )
 from .observer import (
     observe_dram,
@@ -77,6 +94,15 @@ from .design_engine import (
     sweep_sram_vdd,
     sweep_sram_temperature,
     verify_sram,
+    # A1: Sense Amplifier
+    simulate_sa_vs_retention,
+    sweep_sa_offset,
+    # A2: Row Hammer
+    simulate_row_hammer,
+    find_row_hammer_threshold,
+    # A3: SRAM 3모드
+    sram_mode_analysis,
+    sweep_sram_mode_beta,
 )
 from .presets import (
     LPDDR5_PARAMS,
@@ -92,7 +118,7 @@ from .presets import (
     list_presets,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     # 스키마
@@ -103,6 +129,16 @@ __all__ = [
     "SRAMDesignParams",
     "MemoryObservation",
     "VerificationReport",
+    # 센스앰프
+    "SAParams",
+    "SAObservation",
+    "sense_op",
+    "sa_bit_error_rate",
+    "sa_row_ber",
+    "sa_min_delta_v_for_ber",
+    "SA_PARAMS_7NM",
+    "SA_PARAMS_28NM",
+    "SA_PARAMS_65NM",
     # DRAM 물리
     "retention_tau",
     "retention_decay",
@@ -113,6 +149,8 @@ __all__ = [
     "dram_read_margin",
     "refresh_needed",
     "time_to_fail",
+    "row_hammer_disturb",
+    "row_hammer_failure_threshold",
     # SRAM 물리
     "vtc_curve",
     "static_noise_margin",
@@ -124,6 +162,9 @@ __all__ = [
     "sram_write",
     "sram_read",
     "sram_leakage_decay",
+    "read_node_disturb_v",
+    "read_snm_physical",
+    "snm_by_mode",
     # Observer
     "observe_dram",
     "observe_sram",
@@ -141,6 +182,15 @@ __all__ = [
     "sweep_sram_vdd",
     "sweep_sram_temperature",
     "verify_sram",
+    # A1 Sense Amplifier 엔진
+    "simulate_sa_vs_retention",
+    "sweep_sa_offset",
+    # A2 Row Hammer 엔진
+    "simulate_row_hammer",
+    "find_row_hammer_threshold",
+    # A3 SRAM 3모드 분석
+    "sram_mode_analysis",
+    "sweep_sram_mode_beta",
     # 프리셋
     "LPDDR5_PARAMS",
     "DDR5_PARAMS",

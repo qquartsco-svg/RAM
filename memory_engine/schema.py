@@ -3,6 +3,10 @@
 메모리 유형:
   DRAM : 1T1C 커패시터 셀. 전하 보존·방전·refresh 주기·read disturb 모형화.
   SRAM : 6T 크로스커플 인버터 셀. SNM(Static Noise Margin)·읽기·쓰기 마진 모형화.
+
+v0.2.0 추가:
+  SAParams       : 센스앰프 파라미터 (오프셋·감지시간·복구시간).
+  SAObservation  : 센스앰프 동작 관측 결과 (마진·비트오류·BER).
 """
 
 from __future__ import annotations
@@ -237,4 +241,67 @@ class VerificationReport:
             "endurance_margin": self.endurance_margin,
             "omega_global":     self.omega_global,
             "notes":            list(self.notes),
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v0.2.0 — 센스앰프 스키마
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class SAParams:
+    """DRAM 센스앰프(Sense Amplifier) 파라미터.
+
+    동작 원리:
+      1. Precharge (EQ pulse): BL = BLB = Vdd/2
+      2. WL enable → 저장 커패시터 전하 공유: ΔV = q·Vdd·Cs/(Cs+Cbl)
+      3. SA latch: ΔV vs sa_offset_v 비교 → 증폭
+      4. Restore: 읽은 값을 셀에 재기록
+
+    sa_offset_v     : SA 입력 등가 오프셋 전압 [V].
+                      트랜지스터 미스매치로 발생. 3σ 기준:
+                        7nm  ≈ 5~10mV / 28nm ≈ 15~25mV / 65nm ≈ 25~40mV.
+    sa_sensitivity_v: SA가 안정 감지하는 최소 ΔV [V]. 일반적으로 sa_offset_v × 1.3.
+    t_sense_ns      : Latch 완료까지 시간 [ns].
+    t_restore_ns    : 셀 전하 복구 시간 [ns].
+    sigma_offset_v  : 오프셋 표준편차 [V] (BER 계산용). None이면 sa_offset_v/3 사용.
+    n_bits_per_row  : 한 DRAM row의 비트 수 (행 레벨 BER 계산용).
+    """
+    sa_offset_v: float = 0.020        # 20mV (28nm 기준)
+    sa_sensitivity_v: float = 0.026   # 26mV
+    t_sense_ns: float = 2.0
+    t_restore_ns: float = 3.0
+    sigma_offset_v: Optional[float] = None   # None → sa_offset_v/3
+    n_bits_per_row: int = 1024
+
+
+@dataclass
+class SAObservation:
+    """센스앰프 동작 관측 결과.
+
+    delta_v      : 비트라인 차동 전압 ΔV [V].
+    sa_margin_v  : SA 마진 = ΔV − sa_offset_v [V]. 음수면 비트 오류.
+    read_success : SA 마진 > 0.
+    ber          : 비트 오류율 (Bit Error Rate). Q-function 기반.
+    omega_sa     : SA 건강도 [0,1] = clamp(ΔV / (Vdd/2)).
+    t_total_ns   : 총 접근 시간 (sense + restore) [ns].
+    flags        : 'sa_bit_error' / 'sa_margin_marginal'.
+    """
+    delta_v: float
+    sa_margin_v: float
+    read_success: bool
+    ber: float
+    omega_sa: float
+    t_total_ns: float
+    flags: List[str] = field(default_factory=list)
+
+    def as_dict(self) -> Dict[str, object]:
+        return {
+            "delta_v":      self.delta_v,
+            "sa_margin_v":  self.sa_margin_v,
+            "read_success": self.read_success,
+            "ber":          self.ber,
+            "omega_sa":     self.omega_sa,
+            "t_total_ns":   self.t_total_ns,
+            "flags":        list(self.flags),
         }

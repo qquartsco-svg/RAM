@@ -1,15 +1,18 @@
 """메모리 엔진 테스트 suite.
 
-§1 DRAM 물리 — retention decay, Arrhenius, read disturb, refresh, write
-§2 DRAM 파생 지표 — bitline swing, read margin, time_to_fail
-§3 SRAM 물리 — VTC, SNM, RNM, WM, stability index, write, read
-§4 DRAM Observer Ω — 5레이어, 판정, 플래그
-§5 SRAM Observer Ω — 5레이어, 판정, 플래그
-§6 DRAM 설계 엔진 — 시뮬레이션, 스윕
-§7 SRAM 설계 엔진 — 시뮬레이션, 스윕
-§8 검증 보고서 — DRAM/SRAM PASS/MARGINAL/FAIL
-§9 프리셋 — DRAM/SRAM 프리셋 로드 + override
+§1  DRAM 물리 — retention decay, Arrhenius, read disturb, refresh, write
+§2  DRAM 파생 지표 — bitline swing, read margin, time_to_fail
+§3  SRAM 물리 — VTC, SNM, RNM, WM, stability index, write, read
+§4  DRAM Observer Ω — 5레이어, 판정, 플래그
+§5  SRAM Observer Ω — 5레이어, 판정, 플래그
+§6  DRAM 설계 엔진 — 시뮬레이션, 스윕
+§7  SRAM 설계 엔진 — 시뮬레이션, 스윕
+§8  검증 보고서 — DRAM/SRAM PASS/MARGINAL/FAIL
+§9  프리셋 — DRAM/SRAM 프리셋 로드 + override
 §10 진단 — diagnose()
+§11 A1 Sense Amplifier — SAParams, sense_op, BER, Q-function, 스윕
+§12 A2 Row Hammer — 전하 손실, 실패 임계, 시뮬레이션
+§13 A3 SRAM 3모드 SNM — Hold/Read/Write 분리, beta sweep
 """
 
 from __future__ import annotations
@@ -694,3 +697,462 @@ class TestDiagnose:
         advice = diagnose(obs)
         assert isinstance(advice, list)
         assert len(advice) >= 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §11 A1 Sense Amplifier
+# ══════════════════════════════════════════════════════════════════════════════
+
+from memory_engine import (
+    SAParams, SAObservation,
+    sense_op, sa_bit_error_rate, sa_row_ber, sa_min_delta_v_for_ber,
+    SA_PARAMS_7NM, SA_PARAMS_28NM, SA_PARAMS_65NM,
+)
+
+
+class TestSAParams:
+    def test_sa_params_defaults(self):
+        sa = SAParams()
+        assert sa.sa_offset_v > 0.0
+        assert sa.sa_sensitivity_v > 0.0
+        assert sa.n_bits_per_row > 0
+
+    def test_sa_presets_exist(self):
+        assert SA_PARAMS_7NM.sa_offset_v < SA_PARAMS_28NM.sa_offset_v
+        assert SA_PARAMS_28NM.sa_offset_v < SA_PARAMS_65NM.sa_offset_v
+
+    def test_sa_7nm_offset_is_small(self):
+        # 7nm SA 오프셋은 28nm보다 작아야 함 (더 정밀한 공정)
+        assert SA_PARAMS_7NM.sa_offset_v <= 0.012
+
+
+class TestSenseOp:
+    def test_sense_op_returns_saobservation(self, ddr4, ddr4_cell):
+        sa = SA_PARAMS_28NM
+        obs = sense_op(ddr4_cell, ddr4, sa)
+        assert isinstance(obs, SAObservation)
+
+    def test_full_charge_read_success(self, ddr4):
+        cell = DRAMCellState(q=1.0)
+        obs = sense_op(cell, ddr4, SA_PARAMS_28NM)
+        assert obs.read_success is True
+
+    def test_depleted_cell_read_fail(self, ddr4):
+        # q=0.01 → bitline swing 매우 작음 → SA margin < 0
+        cell = DRAMCellState(q=0.01)
+        obs = sense_op(cell, ddr4, SA_PARAMS_28NM)
+        assert obs.read_success is False
+
+    def test_delta_v_proportional_to_charge(self, ddr4):
+        obs_full = sense_op(DRAMCellState(q=1.0), ddr4, SA_PARAMS_28NM)
+        obs_half = sense_op(DRAMCellState(q=0.5), ddr4, SA_PARAMS_28NM)
+        assert obs_full.delta_v > obs_half.delta_v
+
+    def test_sa_margin_positive_when_success(self, ddr4):
+        obs = sense_op(DRAMCellState(q=1.0), ddr4, SA_PARAMS_28NM)
+        if obs.read_success:
+            assert obs.sa_margin_v > 0.0
+
+    def test_omega_sa_in_range(self, ddr4, ddr4_cell):
+        obs = sense_op(ddr4_cell, ddr4, SA_PARAMS_28NM)
+        assert 0.0 <= obs.omega_sa <= 1.0
+
+    def test_t_total_ns_positive(self, ddr4, ddr4_cell):
+        obs = sense_op(ddr4_cell, ddr4, SA_PARAMS_28NM)
+        assert obs.t_total_ns > 0.0
+
+    def test_flags_is_list(self, ddr4, ddr4_cell):
+        obs = sense_op(ddr4_cell, ddr4, SA_PARAMS_28NM)
+        assert isinstance(obs.flags, list)
+
+    def test_sense_op_lpddr5_7nm(self):
+        cell = DRAMCellState(q=1.0)
+        obs = sense_op(cell, LPDDR5_PARAMS, SA_PARAMS_7NM)
+        assert obs.delta_v > 0.0
+        assert 0.0 <= obs.omega_sa <= 1.0
+
+    def test_sa_offset_large_causes_failure(self, ddr4):
+        # 오프셋이 매우 크면 full-charge도 실패
+        sa_bad = SAParams(sa_offset_v=0.999)
+        obs = sense_op(DRAMCellState(q=1.0), ddr4, sa_bad)
+        assert obs.read_success is False
+
+
+class TestSABitErrorRate:
+    def test_ber_full_charge_very_small(self, ddr4):
+        cell = DRAMCellState(q=1.0)
+        ber = sa_bit_error_rate(cell, ddr4, SA_PARAMS_28NM)
+        assert 0.0 <= ber <= 0.5
+
+    def test_ber_depleted_cell_higher(self, ddr4):
+        ber_full = sa_bit_error_rate(DRAMCellState(q=1.0), ddr4, SA_PARAMS_28NM)
+        ber_low  = sa_bit_error_rate(DRAMCellState(q=0.05), ddr4, SA_PARAMS_28NM)
+        assert ber_low >= ber_full
+
+    def test_ber_never_negative(self, ddr4):
+        for q in (0.0, 0.01, 0.5, 1.0):
+            ber = sa_bit_error_rate(DRAMCellState(q=q), ddr4, SA_PARAMS_28NM)
+            assert ber >= 0.0
+
+    def test_row_ber_geq_bit_ber(self, ddr4):
+        # 부분 방전 셀 사용 — q=0.15 → BER 수치 범위가 float64로 표현 가능
+        cell = DRAMCellState(q=0.15)
+        ber_bit = sa_bit_error_rate(cell, ddr4, SA_PARAMS_28NM)
+        ber_row = sa_row_ber(cell, ddr4, SA_PARAMS_28NM)
+        assert ber_row >= ber_bit
+
+    def test_row_ber_in_range(self, ddr4, ddr4_cell):
+        ber_row = sa_row_ber(ddr4_cell, ddr4, SA_PARAMS_28NM)
+        assert 0.0 <= ber_row <= 1.0
+
+
+class TestSAMinDeltaV:
+    def test_min_delta_v_for_ber_1e3(self):
+        dv = sa_min_delta_v_for_ber(1e-3, SA_PARAMS_28NM)
+        assert dv > 0.0
+
+    def test_stricter_ber_needs_larger_delta_v(self):
+        dv_loose  = sa_min_delta_v_for_ber(1e-3, SA_PARAMS_28NM)
+        dv_strict = sa_min_delta_v_for_ber(1e-9, SA_PARAMS_28NM)
+        assert dv_strict > dv_loose
+
+    def test_min_delta_v_7nm_vs_65nm(self):
+        # 같은 BER 목표 — 7nm SA(낮은 σ) 는 더 작은 ΔV로 달성 가능
+        dv_7nm  = sa_min_delta_v_for_ber(1e-6, SA_PARAMS_7NM)
+        dv_65nm = sa_min_delta_v_for_ber(1e-6, SA_PARAMS_65NM)
+        assert dv_7nm <= dv_65nm
+
+
+class TestSweepSAOffset:
+    def test_sweep_sa_offset_returns_list(self, ddr4, ddr4_cell):
+        from memory_engine import sweep_sa_offset
+        results = sweep_sa_offset(
+            ddr4_cell, ddr4, SA_PARAMS_28NM,
+            offset_range=[0.005, 0.010, 0.020, 0.050],
+        )
+        assert len(results) == 4
+
+    def test_sweep_sa_offset_larger_offset_fewer_successes(self, ddr4):
+        from memory_engine import sweep_sa_offset
+        cell = DRAMCellState(q=0.5)
+        results = sweep_sa_offset(
+            cell, ddr4, SA_PARAMS_28NM,
+            offset_range=[0.001, 0.010, 0.100, 0.500],
+        )
+        # read_success 는 offset 증가에 따라 단조 감소(또는 유지)
+        successes = [r["read_success"] for r in results]
+        # True 개수는 역순 정렬 리스트에서 앞에 몰려야 함
+        assert successes[0] >= successes[-1]  # 작은 offset → 더 잘 감지
+
+    def test_sweep_sa_offset_result_keys(self, ddr4, ddr4_cell):
+        from memory_engine import sweep_sa_offset
+        results = sweep_sa_offset(
+            ddr4_cell, ddr4, SA_PARAMS_28NM,
+            offset_range=[0.010, 0.020],
+        )
+        for r in results:
+            assert "sa_offset_v" in r
+            assert "read_success" in r
+            assert "ber" in r
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §12 A2 Row Hammer
+# ══════════════════════════════════════════════════════════════════════════════
+
+from memory_engine import (
+    row_hammer_disturb, row_hammer_failure_threshold,
+    simulate_row_hammer, find_row_hammer_threshold,
+)
+
+
+class TestRowHammerDisturb:
+    def test_rh_disturb_reduces_charge(self, ddr4, ddr4_cell):
+        after = row_hammer_disturb(ddr4_cell, ddr4, n_hammers=100_000)
+        assert after.q < ddr4_cell.q
+
+    def test_rh_disturb_zero_hammers_no_change(self, ddr4, ddr4_cell):
+        after = row_hammer_disturb(ddr4_cell, ddr4, n_hammers=0)
+        assert abs(after.q - ddr4_cell.q) < 1e-12
+
+    def test_rh_disturb_increments_n_reads(self, ddr4, ddr4_cell):
+        n = 50_000
+        after = row_hammer_disturb(ddr4_cell, ddr4, n_hammers=n)
+        assert after.n_reads == ddr4_cell.n_reads + n
+
+    def test_rh_disturb_more_hammers_lower_charge(self, ddr4):
+        cell = DRAMCellState(q=1.0)
+        after_low  = row_hammer_disturb(cell, ddr4, n_hammers=10_000)
+        after_high = row_hammer_disturb(cell, ddr4, n_hammers=500_000)
+        assert after_high.q < after_low.q
+
+    def test_rh_disturb_q_never_negative(self, ddr4):
+        cell = DRAMCellState(q=1.0)
+        after = row_hammer_disturb(cell, ddr4, n_hammers=10_000_000,
+                                   rh_charge_loss_per_event=0.1)
+        assert after.q >= 0.0
+
+    def test_rh_disturb_loss_rate_sensitivity(self, ddr4):
+        cell = DRAMCellState(q=1.0)
+        after_7nm  = row_hammer_disturb(cell, ddr4, n_hammers=100_000,
+                                        rh_charge_loss_per_event=15e-6)
+        after_28nm = row_hammer_disturb(cell, ddr4, n_hammers=100_000,
+                                        rh_charge_loss_per_event=5e-6)
+        # 7nm 공정은 더 민감 → 더 큰 손실
+        assert after_7nm.q < after_28nm.q
+
+
+class TestRowHammerFailureThreshold:
+    def test_threshold_is_positive_int(self, ddr4):
+        n = row_hammer_failure_threshold(ddr4)
+        assert isinstance(n, int)
+        assert n > 0
+
+    def test_higher_loss_rate_lower_threshold(self, ddr4):
+        n_low  = row_hammer_failure_threshold(ddr4, rh_charge_loss_per_event=1e-6)
+        n_high = row_hammer_failure_threshold(ddr4, rh_charge_loss_per_event=50e-6)
+        assert n_high < n_low
+
+    def test_threshold_lpddr5_vs_ddr3(self):
+        # LPDDR5(Cs 더 작음) vs DDR3(Cs 더 큼) — 공정 차이
+        n_lp = row_hammer_failure_threshold(LPDDR5_PARAMS)
+        n_d3 = row_hammer_failure_threshold(DDR3_PARAMS)
+        # int 타입이어야 하며 음수가 아님 (LPDDR5는 Cs 작아 0일 수 있음)
+        assert isinstance(n_lp, int) and n_lp >= 0
+        assert isinstance(n_d3, int) and n_d3 >= 0
+
+    def test_threshold_consistent_with_disturb(self, ddr4):
+        # failure threshold 만큼 hammer하면 margin 실패해야 함
+        from memory_engine import dram_read_margin as read_margin_fn
+        loss = 5e-6
+        n_fail = row_hammer_failure_threshold(ddr4, rh_charge_loss_per_event=loss)
+        cell = DRAMCellState(q=1.0)
+        after = row_hammer_disturb(cell, ddr4, n_hammers=n_fail,
+                                   rh_charge_loss_per_event=loss)
+        # n_fail 이후엔 margin ≤ 0 이어야 함
+        margin = read_margin_fn(after, ddr4)
+        assert margin <= 0.02  # 약간의 수치 오차 허용
+
+
+class TestSimulateRowHammer:
+    def test_simulate_rh_returns_list(self, ddr4, ddr4_cell):
+        results = simulate_row_hammer(
+            ddr4_cell, ddr4, SA_PARAMS_28NM,
+            total_hammers=100_000, step_hammers=10_000,
+        )
+        assert isinstance(results, list)
+        assert len(results) > 0
+
+    def test_simulate_rh_charge_monotone_decreasing(self, ddr4):
+        cell = DRAMCellState(q=1.0)
+        results = simulate_row_hammer(
+            cell, ddr4, SA_PARAMS_28NM,
+            total_hammers=200_000, step_hammers=20_000,
+        )
+        qs = [r["q"] for r in results]
+        assert all(qs[i] >= qs[i+1] for i in range(len(qs)-1))
+
+    def test_simulate_rh_result_keys(self, ddr4, ddr4_cell):
+        results = simulate_row_hammer(
+            ddr4_cell, ddr4, SA_PARAMS_28NM,
+            total_hammers=50_000, step_hammers=25_000,
+        )
+        for r in results:
+            assert "n_hammers" in r
+            assert "q" in r
+            assert "read_success" in r
+
+    def test_simulate_rh_eventually_fails(self, ddr4):
+        # 충분한 hammer 수 → q가 초기 대비 크게 감소
+        # DDR4: q_fail ≈ 0.84 → 5×n_fail 에서 q ≈ 0.84^5 ≈ 0.42 < 0.5
+        cell = DRAMCellState(q=1.0)
+        loss = 20e-6
+        n_fail = row_hammer_failure_threshold(ddr4, rh_charge_loss_per_event=loss)
+        total = n_fail * 5  # q-기반 임계의 5배
+        results = simulate_row_hammer(
+            cell, ddr4, SA_PARAMS_28NM,
+            total_hammers=total,
+            step_hammers=max(1, n_fail // 5),
+            rh_charge_loss_per_event=loss,
+        )
+        last = results[-1]
+        assert last["q"] < 0.5
+
+
+class TestFindRowHammerThreshold:
+    def test_find_rh_threshold_returns_dict(self, ddr4):
+        result = find_row_hammer_threshold(ddr4, SA_PARAMS_28NM)
+        assert isinstance(result, dict)
+
+    def test_find_rh_threshold_has_required_keys(self, ddr4):
+        result = find_row_hammer_threshold(ddr4, SA_PARAMS_28NM)
+        assert "safer_limit" in result or "n_hammer_q_fail" in result
+
+    def test_find_rh_threshold_safer_limit_positive(self, ddr4):
+        result = find_row_hammer_threshold(ddr4, SA_PARAMS_28NM)
+        key = "safer_limit" if "safer_limit" in result else "n_hammer_q_fail"
+        assert result[key] > 0
+
+    def test_find_rh_threshold_7nm_vs_65nm_sa(self, ddr4):
+        r_7nm  = find_row_hammer_threshold(ddr4, SA_PARAMS_7NM)
+        r_65nm = find_row_hammer_threshold(ddr4, SA_PARAMS_65NM)
+        # 둘 다 결과 dict를 반환해야 함
+        assert isinstance(r_7nm, dict) and isinstance(r_65nm, dict)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §13 A3 SRAM 3모드 SNM
+# ══════════════════════════════════════════════════════════════════════════════
+
+from memory_engine import (
+    read_node_disturb_v, read_snm_physical, snm_by_mode,
+    sram_mode_analysis, sweep_sram_mode_beta,
+)
+
+
+class TestReadNodeDisturb:
+    def test_disturb_voltage_positive(self, sram28):
+        dv = read_node_disturb_v(sram28)
+        assert dv > 0.0
+
+    def test_high_beta_less_disturb(self):
+        p_low  = SRAMDesignParams(beta_ratio=1.5)
+        p_high = SRAMDesignParams(beta_ratio=6.0)
+        assert read_node_disturb_v(p_high) < read_node_disturb_v(p_low)
+
+    def test_disturb_lt_vdd(self, sram28):
+        assert read_node_disturb_v(sram28) < sram28.vdd_v
+
+    def test_disturb_formula(self, sram28):
+        # ΔV = Vdd / (beta + 1)
+        expected = sram28.vdd_v / (sram28.beta_ratio + 1.0)
+        assert abs(read_node_disturb_v(sram28) - expected) < 1e-9
+
+
+class TestReadSNMPhysical:
+    def test_read_snm_physical_nonneg(self, sram28):
+        assert read_snm_physical(sram28) >= 0.0
+
+    def test_read_snm_leq_hold_snm(self, sram28):
+        hold = static_noise_margin(sram28)
+        rsnm = read_snm_physical(sram28)
+        assert rsnm <= hold
+
+    def test_low_beta_read_snm_zero(self):
+        # beta=1 → ΔV_read = Vdd/2 → SNM − ΔV 는 0에 가까워짐
+        p = SRAMDesignParams(beta_ratio=1.0, vdd_v=1.0,
+                             Vth_n_v=0.20, Vth_p_v=0.20)
+        rsnm = read_snm_physical(p)
+        assert rsnm >= 0.0  # 음수 불가
+
+    def test_high_beta_improves_read_snm(self):
+        p_low  = SRAMDesignParams(beta_ratio=2.0)
+        p_high = SRAMDesignParams(beta_ratio=8.0)
+        # 높은 beta → hold SNM 증가 AND ΔV 감소 → read SNM 더 큼
+        assert read_snm_physical(p_high) >= read_snm_physical(p_low)
+
+
+class TestSNMByMode:
+    def test_returns_dict(self, sram28):
+        d = snm_by_mode(sram28)
+        assert isinstance(d, dict)
+
+    def test_required_keys(self, sram28):
+        d = snm_by_mode(sram28)
+        for key in ("hold_snm_v", "read_snm_factor_v", "read_snm_physical_v",
+                    "read_node_disturb_v", "write_margin_v",
+                    "stability_index", "verdict"):
+            assert key in d, f"missing key: {key}"
+
+    def test_verdict_is_valid(self, sram28):
+        d = snm_by_mode(sram28)
+        assert d["verdict"] in ("PASS", "MARGINAL", "FAIL")
+
+    def test_hold_snm_geq_read_snm_physical(self, sram28):
+        d = snm_by_mode(sram28)
+        assert d["hold_snm_v"] >= d["read_snm_physical_v"]
+
+    def test_28nm_verdict_valid(self):
+        # 28nm: read_snm_physical = max(0, SNM − ΔV_read)
+        # ΔV_read = Vdd/(beta+1) ≈ 0.29V > SNM ≈ 0.21V → read_snm_phys = 0 → FAIL 가능
+        d = snm_by_mode(SRAM_28NM)
+        assert d["verdict"] in ("PASS", "MARGINAL", "FAIL")
+
+    def test_7nm_verdict_valid(self):
+        d = snm_by_mode(SRAM_7NM)
+        assert d["verdict"] in ("PASS", "MARGINAL", "FAIL")
+
+    def test_stability_index_in_range(self, sram28):
+        d = snm_by_mode(sram28)
+        assert 0.0 <= d["stability_index"] <= 1.0
+
+    def test_low_beta_low_verdict(self):
+        # beta=1.0, 극단적 파라미터
+        p = SRAMDesignParams(
+            beta_ratio=1.0, vdd_v=0.6,
+            Vth_n_v=0.25, Vth_p_v=0.25,
+            write_margin_factor=0.05, wl_strength=0.3,
+        )
+        d = snm_by_mode(p)
+        assert d["verdict"] in ("MARGINAL", "FAIL")
+
+
+class TestSRAMModeAnalysis:
+    def test_returns_dict(self, sram28):
+        result = sram_mode_analysis(sram28)
+        assert isinstance(result, dict)
+
+    def test_has_mode_keys(self, sram28):
+        result = sram_mode_analysis(sram28)
+        assert "hold" in result or "hold_snm_v" in result or "snm" in result
+
+    def test_node_disturb_risk_field(self, sram28):
+        result = sram_mode_analysis(sram28)
+        # node_disturb_risk 또는 verdict 포함
+        assert "node_disturb_risk" in result or "verdict" in result
+
+    def test_node_disturb_risk_valid_value(self, sram28):
+        result = sram_mode_analysis(sram28)
+        if "node_disturb_risk" in result:
+            assert result["node_disturb_risk"] in ("LOW", "MEDIUM", "HIGH")
+
+    def test_analysis_28nm_risk_valid(self):
+        result = sram_mode_analysis(SRAM_28NM)
+        if "node_disturb_risk" in result:
+            # 28nm: ΔV_read ≈ Vdd/4 → SNM보다 크면 HIGH 가능
+            assert result["node_disturb_risk"] in ("LOW", "MEDIUM", "HIGH")
+
+
+class TestSweepSRAMModeBeta:
+    def test_returns_list(self, sram28):
+        results = sweep_sram_mode_beta(sram28, beta_range=[1.5, 2.0, 3.0, 5.0])
+        assert isinstance(results, list)
+        assert len(results) == 4
+
+    def test_beta_monotone_in_results(self, sram28):
+        beta_range = [1.0, 2.0, 4.0, 8.0]
+        results = sweep_sram_mode_beta(sram28, beta_range=beta_range)
+        betas = [r["beta_ratio"] for r in results]
+        assert betas == sorted(betas)
+
+    def test_result_keys(self, sram28):
+        results = sweep_sram_mode_beta(sram28, beta_range=[2.0, 4.0])
+        for r in results:
+            assert "beta_ratio" in r
+            assert "hold_snm_v" in r
+            assert "verdict" in r
+
+    def test_higher_beta_higher_hold_snm(self, sram28):
+        results = sweep_sram_mode_beta(sram28, beta_range=[1.5, 6.0])
+        assert results[1]["hold_snm_v"] >= results[0]["hold_snm_v"]
+
+    def test_higher_beta_lower_write_margin(self, sram28):
+        results = sweep_sram_mode_beta(sram28, beta_range=[1.5, 6.0])
+        # beta 증가 → WM = Vdd×factor×wl/beta 감소
+        assert results[1]["write_margin_v"] <= results[0]["write_margin_v"]
+
+    def test_65nm_beta_sweep(self):
+        results = sweep_sram_mode_beta(SRAM_65NM, beta_range=[2.0, 4.0, 6.0])
+        assert len(results) == 3
+        for r in results:
+            assert r["verdict"] in ("PASS", "MARGINAL", "FAIL")

@@ -245,6 +245,83 @@ def sram_read(
     return value, rnm
 
 
+def read_node_disturb_v(params: SRAMDesignParams) -> float:
+    """읽기 시 내부 '0' 노드 전압 상승 추정 [V].
+
+    메커니즘:
+      BL=Vdd로 프리차지, WL enable → 접근 트랜지스터(강도: wl_strength)와
+      저장 pull-down NMOS(강도: beta_ratio)의 전류 분배.
+
+      전압 분배기 근사:
+        ΔV_read = Vdd × wl_strength / (beta_ratio × wl_strength + wl_strength)
+               = Vdd / (beta_ratio + 1)
+
+      beta 클수록 pull-down이 강해 노드 상승이 억제됨.
+      이 값이 SNM보다 크면 셀이 뒤집힐 위험.
+
+    Returns:
+        '0' 노드 전압 상승량 ΔV_read [V].
+    """
+    beta = max(1e-3, params.beta_ratio)
+    return params.vdd_v / (beta + 1.0)
+
+
+def read_snm_physical(params: SRAMDesignParams) -> float:
+    """물리 기반 읽기 SNM (Read SNM).
+
+    Hold SNM에서 읽기 시 내부 노드 교란(ΔV_read)을 직접 차감:
+      SNM_read = max(0, SNM_hold − ΔV_read)
+
+    이 공식은 `read_noise_margin()` (SNM × factor) 보다 물리적으로 더 명시적.
+    내부 노드 교란이 SNM을 직접 깎는 개념.
+
+    Returns:
+        물리 기반 RNM [V].
+    """
+    snm_hold = static_noise_margin(params)
+    dv = read_node_disturb_v(params)
+    return max(0.0, snm_hold - dv)
+
+
+def snm_by_mode(params: SRAMDesignParams) -> dict:
+    """3모드 SNM 통합 요약.
+
+    Hold  : 대기 모드. BL=BLB=float (연결 해제). 가장 큰 SNM.
+    Read  : 읽기 모드. BL=BLB=Vdd (프리차지), WL enable.
+            내부 노드 교란 → SNM 감소.
+    Write : 쓰기 마진. WL enable, BL/BLB 차동 인가.
+            WM > 0 이면 쓰기 가능. SNM 개념이 아닌 뒤집기 마진.
+
+    Returns:
+        dict(hold_snm, read_snm_factor, read_snm_physical,
+             write_margin, stability_index, verdict)
+    """
+    snm_hold   = static_noise_margin(params)
+    rnm_factor = read_noise_margin(params)          # SNM × factor
+    rnm_phys   = read_snm_physical(params)          # SNM − ΔV_read
+    wm         = write_margin(params)
+    si         = stability_index(params)
+    dv_read    = read_node_disturb_v(params)
+
+    # 3모드 판정
+    if snm_hold >= 0.08 and min(rnm_factor, rnm_phys) >= 0.03 and wm >= 0.06:
+        verdict = "PASS"
+    elif snm_hold >= 0.04 and min(rnm_factor, rnm_phys) >= 0.015 and wm >= 0.03:
+        verdict = "MARGINAL"
+    else:
+        verdict = "FAIL"
+
+    return {
+        "hold_snm_v":        round(snm_hold, 6),
+        "read_snm_factor_v": round(rnm_factor, 6),
+        "read_snm_physical_v": round(rnm_phys, 6),
+        "read_node_disturb_v": round(dv_read, 6),
+        "write_margin_v":    round(wm, 6),
+        "stability_index":   round(si, 6),
+        "verdict":           verdict,
+    }
+
+
 def sram_leakage_decay(
     cell: SRAMCellState,
     params: SRAMDesignParams,

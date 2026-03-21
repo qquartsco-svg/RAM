@@ -200,6 +200,84 @@ def refresh_needed(
     return read_margin(cell, params) < 0.0
 
 
+def row_hammer_disturb(
+    victim_cell: DRAMCellState,
+    params: DRAMDesignParams,
+    n_hammers: int,
+    rh_charge_loss_per_event: float = 5e-6,
+) -> DRAMCellState:
+    """Row Hammer 교란: 인접 행 반복 활성화로 피해 셀 전하 손실.
+
+    메커니즘:
+      DRAM 어레이에서 인접한 Aggressor row를 N회 반복 활성화(hammer)하면,
+      wordline 간 전기장·커패시턴스 결합으로 Victim row 셀의 전하가 누설.
+
+      모델:
+        Q_victim(n) = Q0 × (1 − rh_charge_loss_per_event)^n
+      (지수 감쇠 — 각 hammer 이벤트마다 비율만큼 손실)
+
+    Args:
+        victim_cell              : 피해 셀 초기 상태.
+        params                   : DRAM 설계 파라미터.
+        n_hammers                : Hammer 횟수 (aggressor row 활성화 수).
+        rh_charge_loss_per_event : hammer 1회당 전하 손실 비율 (0~1).
+                                   공정 의존: 28nm ≈ 5e-6 / 7nm ≈ 15e-6.
+
+    Returns:
+        교란 후 피해 셀 상태 (n_reads += n_hammers 기록).
+    """
+    loss_factor = max(0.0, min(1.0, float(rh_charge_loss_per_event)))
+    survival = (1.0 - loss_factor) ** max(0, int(n_hammers))
+    q_new = max(0.0, victim_cell.q * survival)
+    return DRAMCellState(
+        q=q_new,
+        t_since_refresh_s=victim_cell.t_since_refresh_s,
+        n_reads=victim_cell.n_reads + n_hammers,
+        n_cycles=victim_cell.n_cycles,
+    )
+
+
+def row_hammer_failure_threshold(
+    params: DRAMDesignParams,
+    rh_charge_loss_per_event: float = 5e-6,
+    q_failure_threshold: float = None,
+) -> int:
+    """Row Hammer로 읽기 마진 실패에 도달하는 최소 hammer 횟수.
+
+    읽기 마진 실패 조건:
+      q × Cs/(Cs+Cbl) < sense_threshold_fraction
+      → q_fail = sense_threshold_fraction × (Cs+Cbl)/Cs
+
+    N_fail = log(q_fail / q0) / log(1 − loss_per_event)
+
+    Args:
+        params                   : DRAM 설계 파라미터 (q0=1.0 가정).
+        rh_charge_loss_per_event : hammer 1회당 손실 비율.
+        q_failure_threshold      : 실패 판정 전하 수준 (None → bitline swing 기준 자동계산).
+
+    Returns:
+        실패까지 필요한 hammer 횟수 (int). 실패가 불가능하면 int_max.
+    """
+    import math as _math
+    loss = max(1e-12, min(1.0 - 1e-12, float(rh_charge_loss_per_event)))
+
+    cs  = max(1e-9, params.C_s_fF)
+    cbl = max(1e-9, params.C_bl_fF)
+    thr = max(1e-9, params.sense_threshold_fraction)
+
+    if q_failure_threshold is None:
+        # q 수준에서 bitline swing이 threshold를 넘는 최솟값
+        q_fail = thr * (cs + cbl) / cs
+    else:
+        q_fail = float(q_failure_threshold)
+
+    if q_fail >= 1.0:
+        return 0   # 이미 실패 상태
+
+    n = _math.log(q_fail) / _math.log(1.0 - loss)
+    return max(0, int(_math.ceil(n)))
+
+
 def time_to_fail(
     params: DRAMDesignParams,
 ) -> float:

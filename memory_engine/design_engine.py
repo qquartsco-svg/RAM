@@ -53,7 +53,16 @@ from .dram_physics import (
     retention_tau,
     time_to_fail,
     write as _dram_write,
+    row_hammer_disturb as _row_hammer_disturb,
+    row_hammer_failure_threshold,
 )
+from .sense_amplifier import (
+    sense_op as _sense_op,
+    sa_bit_error_rate as _sa_ber,
+    sa_row_ber as _sa_row_ber,
+    sa_min_delta_v_for_ber,
+)
+from .schema import SAParams, SAObservation
 from .observer import diagnose, observe_dram, observe_sram
 from .sram_physics import (
     read_noise_margin,
@@ -62,6 +71,9 @@ from .sram_physics import (
     stability_index,
     static_noise_margin,
     write_margin,
+    snm_by_mode as _snm_by_mode,
+    read_node_disturb_v,
+    read_snm_physical,
 )
 
 
@@ -588,6 +600,249 @@ def verify_sram(
 # ══════════════════════════════════════════════════════════════════════════════
 # 내부 유틸 — frozen dataclass replace 헬퍼
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A1. Sense Amplifier 시뮬레이션 / 스윕
+# ══════════════════════════════════════════════════════════════════════════════
+
+def simulate_sa_vs_retention(
+    cell: DRAMCellState,
+    dram_params: DRAMDesignParams,
+    sa_params: SAParams,
+    total_s: float,
+    dt_s: float = 1e-3,
+) -> List[Dict[str, Any]]:
+    """시간 경과에 따른 DRAM 전하 방전 + 센스앰프 마진 동시 추적.
+
+    retention_decay와 sense_op를 함께 시뮬레이션:
+      각 시점마다 [q, ΔV, sa_margin, BER, omega_sa] 기록.
+
+    Args:
+        cell        : 초기 셀 상태.
+        dram_params : DRAM 설계 파라미터.
+        sa_params   : 센스앰프 파라미터.
+        total_s     : 총 시뮬레이션 시간 [s].
+        dt_s        : 시간 스텝 [s].
+
+    Returns:
+        시점별 딕트 리스트.
+    """
+    history: List[Dict[str, Any]] = []
+    c = DRAMCellState(q=cell.q, t_since_refresh_s=cell.t_since_refresh_s,
+                      n_reads=cell.n_reads, n_cycles=cell.n_cycles)
+    t = 0.0
+    dt = max(1e-12, float(dt_s))
+    total = max(0.0, float(total_s))
+
+    while t <= total + dt * 0.5:
+        sa_obs = _sense_op(c, dram_params, sa_params)
+        history.append({
+            "t_s":          round(t, 9),
+            "q":            round(c.q, 6),
+            "delta_v":      sa_obs.delta_v,
+            "sa_margin_v":  sa_obs.sa_margin_v,
+            "read_success": sa_obs.read_success,
+            "ber":          sa_obs.ber,
+            "omega_sa":     sa_obs.omega_sa,
+            "flags":        list(sa_obs.flags),
+        })
+        if t >= total:
+            break
+        c = _retention_decay(c, dram_params, dt)
+        t = min(t + dt, total)
+
+    return history
+
+
+def sweep_sa_offset(
+    cell: DRAMCellState,
+    dram_params: DRAMDesignParams,
+    sa_params_base: SAParams,
+    offset_range: List[float],
+) -> List[Dict[str, Any]]:
+    """SA 오프셋 전압 스윕: 오프셋 크기에 따른 마진·BER 변화.
+
+    Args:
+        cell          : 현재 DRAM 셀 상태.
+        dram_params   : DRAM 설계 파라미터.
+        sa_params_base: 기본 SA 파라미터 (sa_offset_v 덮어씀).
+        offset_range  : sa_offset_v 목록 [V].
+
+    Returns:
+        각 오프셋에서의 {sa_offset_v, sa_margin_v, read_success, ber, omega_sa}.
+    """
+    results: List[Dict[str, Any]] = []
+    from dataclasses import replace as _replace
+    for offset in offset_range:
+        sa = _replace(sa_params_base, sa_offset_v=float(offset))
+        obs = _sense_op(cell, dram_params, sa)
+        results.append({
+            "sa_offset_v":  round(offset, 6),
+            "sa_margin_v":  obs.sa_margin_v,
+            "read_success": obs.read_success,
+            "ber":          obs.ber,
+            "omega_sa":     obs.omega_sa,
+        })
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A2. Row Hammer 시뮬레이션
+# ══════════════════════════════════════════════════════════════════════════════
+
+def simulate_row_hammer(
+    victim_cell: DRAMCellState,
+    dram_params: DRAMDesignParams,
+    sa_params: SAParams,
+    total_hammers: int,
+    step_hammers: int = 1000,
+    rh_charge_loss_per_event: float = 5e-6,
+) -> List[Dict[str, Any]]:
+    """Row Hammer 누적 시뮬레이션.
+
+    step_hammers 간격으로 hammer를 적용하며 피해 셀 전하·SA 마진 추적.
+
+    Args:
+        victim_cell              : 피해 셀 초기 상태.
+        dram_params              : DRAM 설계 파라미터.
+        sa_params                : 센스앰프 파라미터.
+        total_hammers            : 총 hammer 횟수.
+        step_hammers             : 기록 간격 (n_hammers 단위).
+        rh_charge_loss_per_event : hammer 1회당 전하 손실 비율.
+
+    Returns:
+        각 체크포인트의 {n_hammers, q, sa_margin_v, read_success, ber, omega_sa} 리스트.
+    """
+    history: List[Dict[str, Any]] = []
+    c = DRAMCellState(q=victim_cell.q, t_since_refresh_s=victim_cell.t_since_refresh_s,
+                      n_reads=victim_cell.n_reads, n_cycles=victim_cell.n_cycles)
+    n = 0
+
+    while n <= total_hammers:
+        sa_obs = _sense_op(c, dram_params, sa_params)
+        history.append({
+            "n_hammers":    n,
+            "q":            round(c.q, 6),
+            "sa_margin_v":  sa_obs.sa_margin_v,
+            "read_success": sa_obs.read_success,
+            "ber":          sa_obs.ber,
+            "omega_sa":     sa_obs.omega_sa,
+            "flags":        list(sa_obs.flags),
+        })
+        if n >= total_hammers:
+            break
+        step = min(step_hammers, total_hammers - n)
+        c = _row_hammer_disturb(c, dram_params, step, rh_charge_loss_per_event)
+        n += step
+
+    return history
+
+
+def find_row_hammer_threshold(
+    dram_params: DRAMDesignParams,
+    sa_params: SAParams,
+    rh_charge_loss_per_event: float = 5e-6,
+    q_init: float = 1.0,
+) -> Dict[str, Any]:
+    """Row Hammer 실패 임계 분석.
+
+    SA 마진 실패와 물리적 전하 실패 두 기준에서 각각 임계 hammer 수 계산.
+
+    Returns:
+        {n_hammer_sa_fail, n_hammer_q_fail, sa_margin_at_threshold, safer_limit}.
+    """
+    # SA 실패 임계: ΔV < sa_offset_v
+    # ΔV = q × Vdd × Cs/(Cs+Cbl)
+    cs  = max(1e-9, dram_params.C_s_fF)
+    cbl = max(1e-9, dram_params.C_bl_fF)
+    vdd = dram_params.vdd_v
+    # q 수준에서 SA가 실패하는 q_sa_fail
+    q_sa_fail = sa_params.sa_offset_v * (cs + cbl) / (cs * vdd)
+
+    loss = max(1e-12, rh_charge_loss_per_event)
+    import math as _math
+
+    if q_sa_fail >= q_init:
+        n_sa = 0
+    else:
+        n_sa = max(0, int(_math.ceil(
+            _math.log(q_sa_fail / q_init) / _math.log(1.0 - loss)
+        )))
+
+    n_q = row_hammer_failure_threshold(dram_params, loss)
+
+    return {
+        "n_hammer_sa_fail":      n_sa,
+        "n_hammer_q_fail":       n_q,
+        "q_sa_fail_threshold":   round(q_sa_fail, 6),
+        "safer_limit":           min(n_sa, n_q),
+        "rh_factor_per_event":   rh_charge_loss_per_event,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A3. SRAM 3모드 SNM 분석
+# ══════════════════════════════════════════════════════════════════════════════
+
+def sram_mode_analysis(params: SRAMDesignParams) -> Dict[str, Any]:
+    """SRAM 3모드(Hold / Read / Write) 마진 통합 분석.
+
+    Returns:
+        snm_by_mode() 결과 + 추가 해석:
+          mode_verdict     : 3모드 최약점 기준 종합 판정.
+          read_write_tradeoff : SNM_hold vs WM 트레이드오프 설명.
+          node_disturb_risk   : 읽기 시 내부 노드 교란 위험도 ('LOW'/'MED'/'HIGH').
+    """
+    modes = _snm_by_mode(params)
+
+    # 노드 교란 위험도
+    dv = read_node_disturb_v(params)
+    snm_hold = static_noise_margin(params)
+    disturb_ratio = dv / max(1e-9, snm_hold)
+    if disturb_ratio < 0.30:
+        node_risk = "LOW"
+    elif disturb_ratio < 0.60:
+        node_risk = "MEDIUM"
+    else:
+        node_risk = "HIGH"
+
+    # 트레이드오프 설명
+    beta = params.beta_ratio
+    if beta < 2.0:
+        tradeoff = "beta 낮음 → SNM 작음·WM 큼 (쓰기 유리·읽기 위험)"
+    elif beta <= 3.0:
+        tradeoff = "beta 균형 → SNM/WM 모두 적정 (설계 권장 구간)"
+    else:
+        tradeoff = "beta 높음 → SNM 큼·WM 작음 (읽기 안전·쓰기 어려움)"
+
+    return {
+        **modes,
+        "node_disturb_risk":    node_risk,
+        "disturb_ratio":        round(disturb_ratio, 4),
+        "read_write_tradeoff":  tradeoff,
+    }
+
+
+def sweep_sram_mode_beta(
+    params: SRAMDesignParams,
+    beta_range: List[float],
+) -> List[Dict[str, Any]]:
+    """beta_ratio 스윕 + 3모드 SNM 분석.
+
+    Args:
+        params    : SRAM 기본 파라미터.
+        beta_range: beta_ratio 목록.
+
+    Returns:
+        각 beta에서의 {beta_ratio, hold_snm, read_snm_physical, write_margin, ...}.
+    """
+    results: List[Dict[str, Any]] = []
+    for beta in beta_range:
+        p = _sram_replace(params, beta_ratio=float(beta))
+        analysis = sram_mode_analysis(p)
+        results.append({"beta_ratio": round(beta, 3), **analysis})
+    return results
+
 
 def _dram_replace(params: DRAMDesignParams, **kwargs: Any) -> DRAMDesignParams:
     """DRAMDesignParams(frozen) 일부 필드 대체 사본 생성."""
